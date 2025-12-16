@@ -1,0 +1,416 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_geometric.nn as geo_nn
+from torch.utils.data import Dataset, DataLoader
+from torch_geometric.data import Data
+from tqdm import tqdm
+from models.informer import Informer
+from torch_geometric.nn import GCNConv
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import matplotlib.pyplot as plt
+from utils.metrics import metric
+
+# 对数据进行归一化处理
+scaler = MinMaxScaler()
+
+# 定义自定义数据集类
+class CustomDataset(Dataset):
+    def __init__(self, x, y):
+        self.X = x
+        self.Y = y
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        x = self.X[idx]
+        y = self.Y[idx]
+        X_t = self.create_time(x)
+        Y_t = self.create_time(y)
+
+        value = x[:, 1:]
+        label = y[:, 1:]
+        value = np.float32(value)
+        label = np.float32(label)
+        return value, label, X_t, Y_t
+
+    def create_time(self, data):
+        time = data[:, 0]
+        time = pd.to_datetime(time)
+        second = np.int32(time.second)[:, None]
+        minute = np.int32(time.minute)[:, None]
+        hour = np.int32(time.hour)[:, None]
+        time_data = np.concatenate([second, minute, hour], axis=-1)
+        return time_data
+
+
+# 定义GCN-Informer模型
+class GCNInformer(nn.Module):
+    def __init__(self, gcn_in_channels, gcn_hidden_channels, gcn_out_channels, num_gcn_layers,
+                 informer_enc_in, informer_dec_in, informer_c_out, informer_out_len):
+        super(GCNInformer, self).__init__()
+
+        # GCN部分
+        self.gcn = GCN(in_channels=gcn_in_channels, hidden_channels=gcn_hidden_channels, out_channels=gcn_out_channels, num_layers=num_gcn_layers)
+
+        # 全连接层
+        self.fc = nn.Linear(3, informer_enc_in)
+
+        # Informer部分
+        self.informer = Informer(enc_in=informer_enc_in, dec_in=informer_dec_in, c_out=informer_c_out, out_len=informer_out_len)
+
+    def forward(self, data, xt, dec_y, yt):
+        # GCN 前向传播，输入形状 (batch_size, 3, 60)
+        gcn_output = self.gcn(data)  # 输出形状 (batch_size, 3, 60)
+
+        # 调整维度，适配Informer输入 (batch_size, 60, 3)
+        gcn_output = gcn_output.permute(0, 2, 1)  # 调整形状为 (batch_size, 60, 3)
+
+        gcn_output =self.fc(gcn_output)
+
+        # Informer 前向传播
+        informer_output = self.informer(gcn_output, xt, dec_y, yt)
+
+        return informer_output
+
+# 定义GCN模型
+class GCN(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers):
+        super(GCN, self).__init__()
+        self.num_layers = num_layers
+        self.convs = nn.ModuleList()
+        for i in range(num_layers):
+            if i == 0:
+                self.convs.append(GCNConv(in_channels, hidden_channels))
+            elif i < num_layers - 1:
+                self.convs.append(GCNConv(hidden_channels, hidden_channels))
+            else:
+                self.convs.append(GCNConv(hidden_channels, out_channels))
+
+    def forward(self, data):
+        x, edge_index, edge_weight = data.x, data.edge_index, data.edge_weight
+        for i in range(self.num_layers):
+            x = self.convs[i](x, edge_index, edge_weight=edge_weight)
+            x = F.relu(x)
+            if i != self.num_layers - 1:
+                x = F.dropout(x, p=0.5, training=self.training)
+        return x
+def load_data(file_path):
+    """从CSV文件加载数据"""
+    datas = pd.read_csv(file_path)
+    # scaler.fit(datas.values[:,1:])
+    return datas.values
+
+# 准备用于训练和测试的数据
+def prepare_data(data, seq_length, output_steps, train_size=0.7, val_size=0.15):
+    # 计算分割点
+    split_point_train = int(len(data) * train_size)
+    split_point_val = int(len(data) * (train_size + val_size))
+
+    # 分割数据
+    train_data = data[:split_point_train]
+    # val_data = data[split_point_train:split_point_val]
+    # test_data = data[split_point_val - seq_length:]
+
+    #在中间部位取测试集
+    test_data = data[split_point_train:split_point_val]
+    val_data = data[split_point_val - seq_length:]
+
+    # 分离时间列
+    train_data_time = train_data[:, 0].reshape(-1, 1)  # 时间列
+    val_data_time = val_data[:, 0].reshape(-1, 1)  # 时间列
+    test_data_time = test_data[:, 0].reshape(-1, 1)  # 时间列
+
+
+    # 特征列
+    train_features = train_data[:, 1:]
+    val_features = val_data[:, 1:]
+    test_features = test_data[:, 1:]
+
+    # 标准化特征数据
+    train_features_scaled = scaler.fit_transform(train_features)
+    val_features_scaled = scaler.transform(val_features)
+    test_features_scaled = scaler.transform(test_features)
+
+    # 将时间列和标准化后的特征数据拼接
+    train_data = np.hstack((train_data_time, train_features_scaled))
+    val_data = np.hstack((val_data_time, val_features_scaled))
+    test_data = np.hstack((test_data_time, test_features_scaled))
+
+    x_train, y_train = create_data(train_data, seq_length, output_steps, 1)
+    x_val, y_val = create_data(val_data, seq_length, output_steps, 1)
+    x_test, y_test = create_data(test_data, seq_length, output_steps, 1)
+
+    return x_train, x_val, x_test, y_train, y_val, y_test
+
+
+def create_data(data,seq_length,output_steps,step):
+    X, y = [], []
+    for i in range(0,len(data) - seq_length - output_steps + 1,step):
+        seq_data = data[i:i + seq_length]
+        X.append(seq_data)
+        target_data = data[i + seq_length - output_steps:i + seq_length + output_steps]
+        y.append(target_data)
+        # if(step==10):
+            # print("x---------")
+            # print(seq_data)
+            # print("y----------")
+            # print(target_data)
+    X = np.array(X)
+    y = np.array(y)
+    return X,y
+
+# 绘制实际和预测数据
+def plot_results(actual, predicted):
+    actual = actual.T
+    predicted = predicted.T
+    plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置字体，以便支持中文标签
+    labels = ['CPU', 'Memory', 'Response Time']  # 每个指标对应的标签
+
+    # 创建和绘制每个指标的图形
+    for i in range(len(labels)):
+        plt.figure(figsize=(10, 3))  # 为每个指标创建一个新的图形
+        plt.plot(actual[i], label='Actual', color='red')  # 绘制实际值
+        plt.plot(predicted[i], label='Prediction', color='green')  # 绘制预测值
+        plt.xlabel('Time Index')
+        plt.ylabel('Value')
+        plt.title(labels[i])
+        plt.legend()
+        plt.show()
+
+def create_edge_index_and_weights(device):
+    # 定义边的连接
+    edge_index = torch.tensor([
+        [0, 2],
+        [2, 0],
+        [0, 1],
+        [1, 0],
+        [1,2],
+        [2,1]
+    ], dtype=torch.long).t().contiguous().to(device)
+
+    # 为每条边分配权重
+    edge_weight = torch.tensor([
+        0.56,
+        0.56,
+        0.66,
+        0.66,
+        0.52,
+        0.52
+    ], dtype=torch.float32).to(device)
+
+    return edge_index, edge_weight
+
+# 使用加权损失
+def weighted_mse_loss(output, target, weights):
+    # 确保权重的维度与输出和目标一致
+    weights = weights.unsqueeze(0).unsqueeze(-1)  # 扩展权重的维度，变成 (1, 1, output_steps)
+    loss = (weights * (output - target) ** 2).mean(dim=0)  # 在样本维度上求平均
+    return loss.mean()
+
+def main():
+    file_path = 'cloud-total.csv'  # 数据文件路径
+    seq_length = 20  # 输入序列长度
+    output_steps = 5  # 输出步长
+    num_epochs = 60  # 训练轮数
+    batch_size = 64  # 批量大小
+    learning_rate = 0.0001  # 学习率
+    train_size = 0.8
+    val_size = 0.1
+
+    # 检查GPU是否可用
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
+
+    # 加载并归一化数据
+    dataWithTime = load_data(file_path)  # 加载数据
+    data = dataWithTime
+
+    # 准备数据
+    X_train, X_val, X_test, y_train, y_val, y_test = prepare_data(data, seq_length, output_steps, train_size, val_size)
+
+    # 计算分割点
+    split_point = int(len(data) * train_size)
+
+    # 分割数据(为了在测试的时候合并曲线，这里对测试集进行额外处理)
+    train_data_plt = data[:split_point, 1:]
+
+    # 创建图的边索引（假设完全连接的图）
+    num_nodes = X_train.shape[2] - 1  # 节点数
+    print("num_nodes", num_nodes)
+    print(X_train.shape)
+    # 边索引创建
+    # edge_index = create_edge_index(num_nodes, device)
+
+    # edge_index = torch.tensor([[i, j] for i in range(num_nodes) for j in range(num_nodes) if i != j],
+    #                           dtype=torch.long).t().contiguous().to(device)
+
+    # 边索引创建权重
+    edge_index, edge_weight = create_edge_index_and_weights(device)
+
+    # 创建数据加载器
+    train_dataset = CustomDataset(X_train, y_train)
+    val_dataset = CustomDataset(X_val, y_val)
+    test_dataset = CustomDataset(X_test, y_test)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+
+    # 构建GCN-Informer模型,in_channels一般指的是节点的特征数，这里即为步长
+    model = GCNInformer(gcn_in_channels=seq_length, gcn_hidden_channels=60, gcn_out_channels=seq_length, num_gcn_layers=10, informer_enc_in=3, informer_dec_in=3, informer_c_out=3,
+                        informer_out_len=output_steps).to(device)
+
+    # 损失函数和优化器
+    criterion = nn.MSELoss()
+    criterion = nn.SmoothL1Loss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+    # 权重设置
+    weights = torch.tensor([1 / (i + 1) for i in range(output_steps)], dtype=torch.float32).to(device)
+
+    # 训练循环
+
+    # 初始化早停参数
+    patience = 10  # 允许验证损失不改善的最大周期数
+    min_delta = 0.001 # 认为是有意义的改进的最小阈值
+
+    best_val_loss = float('inf')  # 用于记录最佳验证损失
+    patience_counter = 0  # 记录验证损失未改善的周期数
+
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        model.train()
+        for inputs, labels, xt, yt in tqdm(train_loader, desc=f"Epoch {epoch + 1}", leave=False):
+            optimizer.zero_grad()
+
+            inputs = inputs.permute(0, 2, 1).to(device)
+            labels = labels.to(device)
+            xt = xt.to(device)
+            yt = yt.to(device)
+
+            # 创建一个Data对象，包含节点特征x和边索引edge_index
+            # 创建一个Data对象，包含节点特征x、边索引edge_index和边权重edge_weight
+            data = Data(x=inputs, edge_index=edge_index, edge_weight=edge_weight).to(device)
+
+            mask = torch.zeros_like(labels)[:, output_steps:].to(device)
+            dec_y = torch.cat([labels[:, :output_steps], mask], dim=1)
+
+            # Forward pass
+            informer_output = model(data, xt, dec_y, yt)
+            print(type(informer_output))
+
+            # 计算损失
+            # loss = criterion(informer_output, labels[:, output_steps:])
+            # # 计算损失
+            # loss = weighted_mse_loss(informer_output, labels[:, output_steps:], weights)  # 使用加权损失
+            loss = criterion(informer_output, labels[:, output_steps:])  # 或使用SmoothL1损失
+
+            # 反向传播和优化
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * inputs.size(0)
+
+        epoch_loss = running_loss / len(train_loader.dataset)
+        print(f"Epoch {epoch + 1}, Loss: {epoch_loss:.4f}")
+
+        # 验证模型
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for inputs, labels, xt, yt in val_loader:
+                inputs = inputs.permute(0, 2, 1).to(device)
+                labels = labels.to(device)
+                xt = xt.to(device)
+                yt = yt.to(device)
+
+                # 创建一个Data对象，包含节点特征x、边索引edge_index和边权重edge_weight
+                data = Data(x=inputs, edge_index=edge_index, edge_weight=edge_weight).to(device)
+
+                mask = torch.zeros_like(labels)[:, output_steps:].to(device)
+                dec_y = torch.cat([labels[:, :output_steps], mask], dim=1)
+
+                # Forward pass
+                informer_output = model(data, xt, dec_y, yt)
+
+                # 计算损失
+                loss = criterion(informer_output, labels[:, output_steps:])
+                val_loss += loss.item() * inputs.size(0)
+
+        val_loss = val_loss / len(val_loader.dataset)
+        print(f"Validation Loss: {val_loss:.4f}")
+
+        # 早停检查
+        if val_loss < best_val_loss - min_delta:
+            best_val_loss = val_loss
+            patience_counter = 0
+            print("文件更新-----------------")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': best_val_loss
+            }, "D:\\checkPoint\\GcnInformer_master_bak.pth")
+            print(f"Saved new best model with validation loss: {best_val_loss:.4f}")
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping triggered. Validation loss has not improved for {patience} epochs.")
+            break
+
+    # 测试模型
+    checkpoint = torch.load("D:\checkPoint\GcnInformer_master_bak.pth")
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    print("Loaded best model parameters.")
+
+    with torch.no_grad():
+        model.eval()
+        preds = []
+        trues = []
+
+        for inputs, labels, xt, yt in test_loader:
+            inputs = inputs.permute(0, 2, 1).to(device)
+            labels = labels.to(device)
+            xt = xt.to(device)
+            yt = yt.to(device)
+
+            # 创建一个Data对象，包含节点特征x、边索引edge_index和边权重edge_weight
+            data = Data(x=inputs, edge_index=edge_index, edge_weight=edge_weight).to(device)
+
+            # 训练Informer模型
+            mask = torch.zeros_like(labels)[:, output_steps:].to(device)
+            dec_y = torch.cat([labels[:, :output_steps], mask], dim=1)
+
+            informer_output = model(data, xt, dec_y, yt)
+
+            predicted = np.squeeze(informer_output.cpu().detach().numpy())
+            actual = np.squeeze(labels[:, output_steps:].cpu().detach().numpy())
+
+            preds.append(predicted)
+            trues.append(actual)
+
+        print("preds,", len(preds))
+        preds = np.array(preds)
+        trues = np.array(trues)
+
+        mae, mse, rmse, mape, mspe = metric(preds, trues)
+        print("data形状", preds.shape, trues.shape)
+        print(f'MSE: {mse:.4f}')
+        print(f'MAE: {mae:.4f}')
+
+        preds = preds.reshape(-1, preds.shape[-1])
+        trues = trues.reshape(-1, trues.shape[-1])
+        preds = scaler.inverse_transform(preds)
+        trues = scaler.inverse_transform(trues)
+
+        plot_results(trues[:150], preds[:150])
+
+
+if __name__ == '__main__':
+    main()
